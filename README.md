@@ -1,4 +1,7 @@
 # MidgetRaceCar-Telemetry
+
+#WORK IN PROGRESS NOT FINAL
+
 Since testing has been moved there had to be redesigns in the current model.  Instead of using Lora board and make it modular it is now all on board.
 
 This set up now uses the MPU6500 along with a GY-271 to get six axis and measure the acceleration, along with roll pitch and yaw.
