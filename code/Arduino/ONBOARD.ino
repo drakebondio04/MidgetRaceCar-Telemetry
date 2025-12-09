@@ -7,80 +7,148 @@
 // ---------------------------------------------------------
 //   Pins & addresses
 // ---------------------------------------------------------
-const int PIN_I2C_SDA = 22;      // I2C SDA
-const int PIN_I2C_SCL = 21;      // I2C SCL
+const int PIN_I2C_SDA = 22;
+const int PIN_I2C_SCL = 21;
 
 const uint8_t MPU_ADDR = 0x68;   // MPU6500 accel/gyro
+const uint8_t MAG_ADDR = 0x2C;   // HP5883 / QMC-type mag
 
-// GPS on UART2 (Serial2) - MATCHING YOUR WORKING ECHO CODE
+// GPS on UART2
 const int PIN_GPS_RX  = 17;      // ESP32 RX2 <- GT-U7 TX
-const int PIN_GPS_TX  = 16;      // ESP32 TX2 -> GT-U7 RX (optional)
+const int PIN_GPS_TX  = 16;      // ESP32 TX2 -> GT-U7 RX
 
 HardwareSerial SerialGPS(2);
 TinyGPSPlus gps;
 
-// SD card (SPI) - Option A: CS=5, CLK=18, MISO=19, MOSI=23
+// SD card
 const int PIN_SD_CS = 5;
 File logFile;
+
+// ---------------------------------------------------------
+//   Tach pulse logging
+// ---------------------------------------------------------
+// Tach input from ECU "V" pin through divider
+const int PIN_RPM = 34;
+
+// ISR-visible state
+volatile uint32_t tach_pulseCount = 0;       // pulses since last log
+volatile uint32_t tach_lastPulseMicros = 0;  // timestamp of last pulse
+volatile uint32_t tach_minDtUs = 0xFFFFFFFF; // smallest dt between pulses in current window
+
+// Simple ISR: count *all* rising edges and track smallest dt between them
+void IRAM_ATTR rpmISR() {
+  uint32_t now = micros();
+
+  if (tach_lastPulseMicros != 0) {
+    uint32_t dt = now - tach_lastPulseMicros;
+    if (dt < tach_minDtUs) {
+      tach_minDtUs = dt;
+    }
+  }
+
+  tach_lastPulseMicros = now;
+  tach_pulseCount++;
+}
+
+// ---------------------------------------------------------
+//   Throttle ADC (RAW percentage)
+// ---------------------------------------------------------
+// Throttle signal on ADC pin 33 (0–5 V divided to 0–2.5 V)
+const int PIN_THROTTLE = 33;
+
+// From your calibration:
+const int THROTTLE_ADC_MIN = 1808;// 1323 47 and 1808 47x
+const int THROTTLE_ADC_MAX = 2263; // 1819 47 and 2263 47x
+
+// Raw throttle percentage (0–100%)
+float throttle_pct = 0.0f;
 
 // ---------------------------------------------------------
 //   Timing
 // ---------------------------------------------------------
 unsigned long lastUpdateMicros = 0;
-const unsigned long PRINT_INTERVAL_MS = 100; // 10 Hz output
+// 25 Hz debug/log print (~40 ms)
+const unsigned long PRINT_INTERVAL_MS = 40;
 unsigned long lastPrint = 0;
 
 // ---------------------------------------------------------
-//   Calibration samples
-// ---------------------------------------------------------
-const int CALIB_SAMPLES = 2000;
-
-// ---------------------------------------------------------
-//   Calibration values (your measured biases)
+//   IMU biases (will be auto-calibrated)
 // ---------------------------------------------------------
 // accel biases (g)
-float ax_bias = 0.062711;
-float ay_bias = 0.060081;
-float az_bias = -0.073106;   // we’ll force az ≈ 1 g when level
+float ax_bias = 0.0f;
+float ay_bias = 0.0f;
+float az_bias = 0.0f;   // we'll force az ≈ 1 g when level
 
 // gyro biases (deg/s)
-float gx_bias = -1.835813;
-float gy_bias = -0.269863;
-float gz_bias = 0.228622;
+float gx_bias = 0.0f;
+float gy_bias = 0.0f;
+float gz_bias = 0.0f;
 
 // ---------------------------------------------------------
-//   Complementary filter state
+//   Filter state
 // ---------------------------------------------------------
-bool rp_initialized = false;   // did we initialize roll/pitch from accel?
-float roll_f  = 0.0f;          // filtered roll (deg)
-float pitch_f = 0.0f;          // filtered pitch (deg)
-float yaw_f   = 0.0f;          // filtered yaw (deg, gyro-only, will drift)
+bool  rp_initialized   = false;
+float roll_f           = 0.0f;
+float pitch_f          = 0.0f;
 
-// higher = more trust in gyro, lower = more trust in accel
-const float compAlpha = 0.98f;
+// yaw
+float yaw_gyro         = 0.0f;   // pure integrated gyro
+float yaw_fused        = 0.0f;   // drift-corrected yaw
+bool  yaw_initialized  = false;
 
-// Low-pass filter on accel to reduce vibration noise
+// accel low-pass
 float ax_lpf = 0.0f;
 float ay_lpf = 0.0f;
-float az_lpf = 1.0f;   // start near gravity
-const float accelAlpha = 0.2f;   // 0..1, smaller = smoother
+float az_lpf = 1.0f;
+
+const float accelAlpha = 0.2f;   // accel LPF
+const float compAlpha  = 0.98f;  // roll/pitch complementary
 
 // ---------------------------------------------------------
-//   MPU6500 low-level functions
+//   Magnetometer calibration (for logging only)
+// ---------------------------------------------------------
+float mx_bias = 0.0f, my_bias = 0.0f, mz_bias = 0.0f;
+float mx_scale = 1.0f, my_scale = 1.0f, mz_scale = 1.0f;
+const float magDeclinationDeg = 0.0f;   // set for your region if you care
+
+// ---------------------------------------------------------
+//   Fusion thresholds
+// ---------------------------------------------------------
+const float GPS_SPEED_INIT_MPH      = 5.0f;   // min speed to init yaw from GPS
+const float GPS_SPEED_MIN_MPH       = 12.0f;  // min speed to use GPS corrections
+const float GPS_LAT_ACC_THRESH_G    = 0.15f;  // nearly no lateral accel
+const float GPS_YAWRATE_THRESH_DPS  = 25.0f;  // not turning hard
+
+const float GPS_CORR_GAIN           = 0.15f;  // GPS correction gain
+
+// ---------------------------------------------------------
+//   Angle helpers
+// ---------------------------------------------------------
+float wrapAngle180(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a < -180.0f) a += 360.0f;
+  return a;
+}
+
+float wrapAngle360(float a) {
+  while (a >= 360.0f) a -= 360.0f;
+  while (a <  0.0f)   a += 360.0f;
+  return a;
+}
+
+// ---------------------------------------------------------
+//   MPU6500 helpers
 // ---------------------------------------------------------
 void setupMPU() {
-  // Wake up the device (clear sleep bit)
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);      // PWR_MGMT_1
-  Wire.write(0x00);      // set to 0 -> wake up
+  Wire.write(0x00);      // wake
   Wire.endTransmission(true);
-
-  // Optional: set accel/gyro ranges explicitly if you want.
-  // For default config: ±2g accel, ±250 dps gyro.
 }
 
 void readMPURaw(float &ax, float &ay, float &az,
                 float &gx_deg, float &gy_deg, float &gz_deg) {
+
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);           // ACCEL_XOUT_H
   Wire.endTransmission(false);
@@ -89,17 +157,16 @@ void readMPURaw(float &ax, float &ay, float &az,
   int16_t ax_raw = (Wire.read() << 8) | Wire.read();
   int16_t ay_raw = (Wire.read() << 8) | Wire.read();
   int16_t az_raw = (Wire.read() << 8) | Wire.read();
-  Wire.read(); Wire.read(); // temp, ignore
+  Wire.read(); Wire.read(); // temp
   int16_t gx_raw = (Wire.read() << 8) | Wire.read();
   int16_t gy_raw = (Wire.read() << 8) | Wire.read();
   int16_t gz_raw = (Wire.read() << 8) | Wire.read();
 
-  // Convert to physical units
-  ax = ax_raw / 16384.0f;    // g (±2g)
+  ax = ax_raw / 16384.0f;
   ay = ay_raw / 16384.0f;
   az = az_raw / 16384.0f;
 
-  gx_deg = gx_raw / 131.0f;  // deg/s (±250 dps)
+  gx_deg = gx_raw / 131.0f;
   gy_deg = gy_raw / 131.0f;
   gz_deg = gz_raw / 131.0f;
 }
@@ -107,57 +174,44 @@ void readMPURaw(float &ax, float &ay, float &az,
 void readMPU(float &ax, float &ay, float &az,
              float &gx_deg, float &gy_deg, float &gz_deg) {
   readMPURaw(ax, ay, az, gx_deg, gy_deg, gz_deg);
-
-  // Apply bias calibration
-  ax -= ax_bias;
-  ay -= ay_bias;
-  az -= az_bias;
-
+  ax     -= ax_bias;
+  ay     -= ay_bias;
+  az     -= az_bias;
   gx_deg -= gx_bias;
   gy_deg -= gy_bias;
   gz_deg -= gz_bias;
 }
 
 // ---------------------------------------------------------
-//   Accel-only roll / pitch (tilt from gravity)
+//   Simple accel-based roll/pitch
 // ---------------------------------------------------------
 void getAccelRP(float ax, float ay, float az, float &roll_acc, float &pitch_acc) {
-  // Optional: normalize accel vector
   float norm = sqrtf(ax*ax + ay*ay + az*az);
   if (norm > 1e-6f) {
-    ax /= norm;
-    ay /= norm;
-    az /= norm;
+    ax /= norm; ay /= norm; az /= norm;
   }
-
-  // roll: rotation about X-axis (car rolls left/right)
-  roll_acc = atan2f(ay, az) * 180.0f / PI;
-
-  // pitch: rotation about Y-axis (nose up/down)
+  roll_acc  = atan2f(ay, az) * 180.0f / PI;
   pitch_acc = atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / PI;
 }
 
 // ---------------------------------------------------------
-//   Optional calibration routine
+//   Auto-calibrate IMU biases at startup (car still)
 // ---------------------------------------------------------
-void calibrateIMU() {
-  Serial.println();
-  Serial.println("=== IMU Calibration ===");
-  Serial.println("Place the car/board LEVEL and COMPLETELY STILL.");
-  Serial.println("Calibration will start in 3 seconds...");
-  delay(3000);
+void autoCalibrateIMU(int samples = 500) {
+  Serial.println("Auto-calibration: keep car still for ~5 s...");
+
+  float sum_ax = 0, sum_ay = 0, sum_az = 0;
+  float sum_gx = 0, sum_gy = 0, sum_gz = 0;
 
   float ax, ay, az, gx, gy, gz;
-  for (int i = 0; i < 200; i++) {
+
+  // small settle period
+  for (int i = 0; i < 50; i++) {
     readMPURaw(ax, ay, az, gx, gy, gz);
-    delay(2);
+    delay(10);
   }
 
-  Serial.println("Collecting calibration samples...");
-  double sum_ax = 0, sum_ay = 0, sum_az = 0;
-  double sum_gx = 0, sum_gy = 0, sum_gz = 0;
-
-  for (int i = 0; i < CALIB_SAMPLES; i++) {
+  for (int i = 0; i < samples; i++) {
     readMPURaw(ax, ay, az, gx, gy, gz);
 
     sum_ax += ax;
@@ -168,86 +222,116 @@ void calibrateIMU() {
     sum_gy += gy;
     sum_gz += gz;
 
-    delay(2);
+    delay(10); // 100 Hz approx
   }
 
-  float mean_ax = sum_ax / CALIB_SAMPLES;
-  float mean_ay = sum_ay / CALIB_SAMPLES;
-  float mean_az = sum_az / CALIB_SAMPLES;
+  ax_bias = sum_ax / samples;
+  ay_bias = sum_ay / samples;
+  az_bias = (sum_az / samples) - 1.0f;  // 1 g on Z
 
-  float mean_gx = sum_gx / CALIB_SAMPLES;
-  float mean_gy = sum_gy / CALIB_SAMPLES;
-  float mean_gz = sum_gz / CALIB_SAMPLES;
+  gx_bias = sum_gx / samples;
+  gy_bias = sum_gy / samples;
+  gz_bias = sum_gz / samples;
 
-  ax_bias = mean_ax;
-  ay_bias = mean_ay;
-  az_bias = mean_az - 1.0f;
-
-  gx_bias = mean_gx;
-  gy_bias = mean_gy;
-  gz_bias = mean_gz;
-
-  Serial.println("Calibration complete. Biases:");
+  Serial.println("Auto-cal complete:");
   Serial.print("  ax_bias = "); Serial.println(ax_bias, 6);
   Serial.print("  ay_bias = "); Serial.println(ay_bias, 6);
   Serial.print("  az_bias = "); Serial.println(az_bias, 6);
-
   Serial.print("  gx_bias = "); Serial.println(gx_bias, 6);
   Serial.print("  gy_bias = "); Serial.println(gy_bias, 6);
   Serial.print("  gz_bias = "); Serial.println(gz_bias, 6);
-  Serial.println("========================");
 }
 
 // ---------------------------------------------------------
-//   UBX helper: set u-blox update rate to 10 Hz
-//   UBX-CFG-RATE: measRate=100 ms, navRate=1, timeRef=1 (GPS time)
-//   Message: B5 62 06 08 06 00 64 00 01 00 01 00 7A 12
+//   GPS UBX (10 Hz)
 // ---------------------------------------------------------
 void sendUBX(const uint8_t *msg, uint8_t len) {
-  for (uint8_t i = 0; i < len; i++) {
-    SerialGPS.write(msg[i]);
-  }
+  for (uint8_t i = 0; i < len; i++) SerialGPS.write(msg[i]);
   SerialGPS.flush();
 }
 
 const uint8_t UBX_RATE_10HZ[] = {
-  0xB5, 0x62,             // sync chars
-  0x06, 0x08,             // class = CFG, id = RATE
-  0x06, 0x00,             // length = 6
-  0x64, 0x00,             // measRate = 100ms (0x0064)
-  0x01, 0x00,             // navRate = 1
-  0x01, 0x00,             // timeRef = 1 (GPS time)
-  0x7A, 0x12              // CK_A, CK_B
+  0xB5, 0x62, 0x06, 0x08, 0x06, 0x00,
+  0x64, 0x00, 0x01, 0x00, 0x01, 0x00,
+  0x7A, 0x12
 };
 
 // ---------------------------------------------------------
-//   SD helpers: auto-numbered CSV files
+//   Magnetometer (for logging only)
 // ---------------------------------------------------------
-String generateNewFilename() {
-  int fileIndex = 1;
+void setupMag() {
+  const uint8_t MODE_REG   = 0x0A;
+  const uint8_t CONFIG_REG = 0x0B;
 
-  // Look for next available filename up to 999
-  while (fileIndex < 1000) {
-    char filename[20];
-    sprintf(filename, "/log_%03d.csv", fileIndex);
+  Wire.beginTransmission(MAG_ADDR);
+  Wire.write(MODE_REG);
+  Wire.write(0xCF);     // continuous, 200 Hz, ±8G (example – adjust if needed)
+  Wire.endTransmission();
 
-    if (!SD.exists(filename)) {
-      Serial.print("Creating new log file: ");
-      Serial.println(filename);
-      return String(filename);
-    }
-
-    fileIndex++;
-  }
-
-  // Fallback — shouldn’t really happen
-  Serial.println("WARNING: Reached log_999.csv, using it.");
-  return String("/log_999.csv");
+  Wire.beginTransmission(MAG_ADDR);
+  Wire.write(CONFIG_REG);
+  Wire.write(0x08);     // set/reset
+  Wire.endTransmission();
 }
 
+bool readMag(float &mx, float &my, float &mz) {
+  const uint8_t X_LSB_REG = 0x01;
+  Wire.beginTransmission(MAG_ADDR);
+  Wire.write(X_LSB_REG);
+  uint8_t err = Wire.endTransmission(false);
+  if (err != 0) return false;
+
+  const uint8_t toRead = 6;
+  uint8_t got = Wire.requestFrom(MAG_ADDR, toRead);
+  if (got != toRead) {
+    while (Wire.available()) (void)Wire.read();
+    return false;
+  }
+
+  uint8_t x_lsb = Wire.read();
+  uint8_t x_msb = Wire.read();
+  uint8_t y_lsb = Wire.read();
+  uint8_t y_msb = Wire.read();
+  uint8_t z_lsb = Wire.read();
+  uint8_t z_msb = Wire.read();
+
+  int16_t rawX = (int16_t)((x_msb << 8) | x_lsb);
+  int16_t rawY = (int16_t)((y_msb << 8) | y_lsb);
+  int16_t rawZ = (int16_t)((z_msb << 8) | z_lsb);
+
+  mx = (rawX - mx_bias) * mx_scale;
+  my = (rawY - my_bias) * my_scale;
+  mz = (rawZ - mz_bias) * mz_scale;
+
+  return true;
+}
+
+float computeMagYawDeg(float roll_deg, float pitch_deg,
+                       float mx, float my, float mz) {
+  float roll  = roll_deg  * PI / 180.0f;
+  float pitch = pitch_deg * PI / 180.0f;
+
+  float mx2 = mx * cosf(pitch) + mz * sinf(pitch);
+  float my2 = mx * sinf(roll) * sinf(pitch)
+            + my * cosf(roll)
+            - mz * sinf(roll) * cosf(pitch);
+
+  float heading = atan2f(-my2, mx2) * 180.0f / PI;
+  heading += magDeclinationDeg;
+  return wrapAngle360(heading);
+}
+
+// ---------------------------------------------------------
+//   CSV header  (17 columns, throttle_pct added)
+// ---------------------------------------------------------
 void writeCSVHeader() {
   if (!logFile) return;
-  logFile.println("time_ms,ax,ay,az,roll,pitch,yaw,lat,lon,spd_mph");
+  logFile.println(
+    "time_ms,ax,ay,az,roll,pitch,"
+    "yaw_fused,yaw_gyro,yaw_mag,yaw_gps,"
+    "lat,lon,spd_mph,yaw_mode,"
+    "tach_pulses,tach_min_dt_us,throttle_pct"
+  );
   logFile.flush();
 }
 
@@ -257,51 +341,50 @@ void writeCSVHeader() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println();
-  Serial.println("ESP32 Dirt Track IMU + GPS (10 Hz) + SD: roll, pitch, yaw, lat, lon, mph");
+  Serial.println("\nESP32 IMU + GPS + SD + Tach + Throttle (25 Hz log / 10 Hz GPS)");
 
-  // I2C for IMU
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000); // 400 kHz I2C
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
   setupMPU();
+  setupMag();
 
-  // GPS on Serial2, using working RX/TX pins
+  // IMU auto-cal
+  autoCalibrateIMU();   // car must be still here
+
+  // GPS
   SerialGPS.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-  Serial.println("GPS serial started at 9600 baud on RX=17 TX=16...");
-
-  // Give GPS a bit of time to boot before sending UBX config
   delay(1000);
-  Serial.println("Sending UBX command to set GPS rate to 10 Hz...");
   sendUBX(UBX_RATE_10HZ, sizeof(UBX_RATE_10HZ));
   delay(200);
   sendUBX(UBX_RATE_10HZ, sizeof(UBX_RATE_10HZ));
-  Serial.println("UBX CFG-RATE 10 Hz command sent.");
 
-  // SD card
-  Serial.print("Mounting SD card... ");
+  // SD
+  Serial.print("Mounting SD... ");
   if (!SD.begin(PIN_SD_CS)) {
     Serial.println("FAILED");
   } else {
     Serial.println("OK");
-
-    // Create new numbered log file: /log_001.csv, /log_002.csv, ...
-    String fname = generateNewFilename();
-    logFile = SD.open(fname.c_str(), FILE_WRITE);
-    if (!logFile) {
-      Serial.println("Failed to open new log file!");
-    } else {
-      Serial.print("Logging to: ");
-      Serial.println(fname);
-      writeCSVHeader();
+    int fileIndex = 1;
+    char filename[32];
+    while (true) {
+      snprintf(filename, sizeof(filename), "/car_log_%d.csv", fileIndex);
+      if (!SD.exists(filename)) break;
+      fileIndex++;
+      if (fileIndex > 9999) break;
     }
+    Serial.print("Opening: "); Serial.println(filename);
+    logFile = SD.open(filename, FILE_WRITE);
+    if (logFile && logFile.size() == 0) writeCSVHeader();
   }
 
-  // Optional: run IMU calibration if you want to re-measure biases
-  // calibrateIMU();
+  ax_lpf = 0.0f; ay_lpf = 0.0f; az_lpf = 1.0f;
 
-  // Init LPF accel around "gravity up"
-  ax_lpf = 0.0f;
-  ay_lpf = 0.0f;
-  az_lpf = 1.0f;
+  // Tach input + interrupt
+  pinMode(PIN_RPM, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmISR, RISING);
+
+  // Throttle ADC config
+  analogReadResolution(12);                         // 0–4095
+  analogSetPinAttenuation(PIN_THROTTLE, ADC_11db);  // up to ~3.3V
 
   lastUpdateMicros = micros();
   lastPrint = millis();
@@ -311,87 +394,180 @@ void setup() {
 //   Main loop
 // ---------------------------------------------------------
 void loop() {
-  // --- Feed GPS parser continuously ---
-  while (SerialGPS.available()) {
-    gps.encode(SerialGPS.read());
-  }
+  // Feed GPS parser
+  while (SerialGPS.available()) gps.encode(SerialGPS.read());
 
-  // --- Time step (dt in seconds) ---
+  // dt
   unsigned long nowMicros = micros();
   float dt = (nowMicros - lastUpdateMicros) / 1e6f;
-  if (dt <= 0.0f || dt > 0.1f) dt = 0.01f; // clamp
+  if (dt <= 0.0f || dt > 0.1f) dt = 0.01f;
   lastUpdateMicros = nowMicros;
 
-  // --- Read IMU with biases applied ---
-  float ax, ay, az;
-  float gx_deg, gy_deg, gz_deg;
+  // --- IMU ---
+  float ax, ay, az, gx_deg, gy_deg, gz_deg;
   readMPU(ax, ay, az, gx_deg, gy_deg, gz_deg);
 
-  // --- Low-pass filter accel to reduce harsh vibration ---
+  // LPF accel
   ax_lpf = accelAlpha * ax + (1.0f - accelAlpha) * ax_lpf;
   ay_lpf = accelAlpha * ay + (1.0f - accelAlpha) * ay_lpf;
   az_lpf = accelAlpha * az + (1.0f - accelAlpha) * az_lpf;
 
-  // --- Accel-only roll/pitch from filtered accel ---
+  float acc_norm   = sqrtf(ax_lpf*ax_lpf + ay_lpf*ay_lpf + az_lpf*az_lpf);
+  bool  low_dynamic = fabs(acc_norm - 1.0f) < 0.15f;
+
   float roll_acc, pitch_acc;
   getAccelRP(ax_lpf, ay_lpf, az_lpf, roll_acc, pitch_acc);
 
-  // --- Complementary filter for smooth roll/pitch/yaw ---
   if (!rp_initialized) {
-    roll_f  = roll_acc;
+    roll_f = roll_acc;
     pitch_f = pitch_acc;
-    yaw_f   = 0.0f;      // zero yaw at startup
     rp_initialized = true;
   } else {
     float roll_gyro  = roll_f  + gx_deg * dt;
     float pitch_gyro = pitch_f + gy_deg * dt;
-    float yaw_gyro   = yaw_f   + gz_deg * dt;
-
-    roll_f  = compAlpha * roll_gyro  + (1.0f - compAlpha) * roll_acc;
-    pitch_f = compAlpha * pitch_gyro + (1.0f - compAlpha) * pitch_acc;
-
-    // Yaw: gyro-only (no mag) — will slowly drift
-    yaw_f = yaw_gyro;
+    if (low_dynamic) {
+      roll_f  = compAlpha * roll_gyro  + (1.0f - compAlpha) * roll_acc;
+      pitch_f = compAlpha * pitch_gyro + (1.0f - compAlpha) * pitch_acc;
+    } else {
+      roll_f  = roll_gyro;
+      pitch_f = pitch_gyro;
+    }
   }
 
-  // --- Gather GPS data (latest parsed values) ---
+  // --- MAG yaw (for logging / debugging only) ---
+  float mx = 0, my = 0, mz = 0;
+  bool magOK = readMag(mx, my, mz);
+  float yaw_mag = 0.0f;
+  if (magOK) {
+    yaw_mag = computeMagYawDeg(roll_f, pitch_f, mx, my, mz);
+  }
+
+  // --- GPS ---
   double lat     = gps.location.isValid() ? gps.location.lat()  : 0.0;
   double lon     = gps.location.isValid() ? gps.location.lng()  : 0.0;
-  double spd_mph = gps.speed.isValid()    ? gps.speed.mph()     : 0.0;  // mph
+  double spd_mph = gps.speed.isValid()    ? gps.speed.mph()     : 0.0;
 
-  // --- Periodic print & log (10 Hz) ---
+  bool   gpsCourseValid = gps.course.isValid();
+  double gps_course_deg = gpsCourseValid ? gps.course.deg() : 0.0;
+  float  yaw_gps        = wrapAngle360((float)gps_course_deg);
+
+  // --- Yaw fusion (simple: gyro + occasional GPS correction) ---
+  // integrate gyro
+  yaw_gyro = wrapAngle360(yaw_gyro + gz_deg * dt);
+
+  // initial alignment from GPS once moving straight-ish
+  if (!yaw_initialized && gpsCourseValid && (spd_mph > GPS_SPEED_INIT_MPH)) {
+    yaw_gyro    = yaw_gps;
+    yaw_fused   = yaw_gps;
+    yaw_initialized = true;
+  }
+
+  // default: gyro-only
+  yaw_fused = yaw_gyro;
+  uint8_t yaw_mode = 0;  // 0=gyro, 1=GPS-corrected
+
+  // conditions to trust GPS (no big cornering)
+  float lat_g = ay_lpf; // approx lateral acceleration in body frame
+  bool low_lat      = fabs(lat_g)  < GPS_LAT_ACC_THRESH_G;
+  bool low_yaw_rate = fabs(gz_deg) < GPS_YAWRATE_THRESH_DPS;
+
+  bool useGPS = yaw_initialized &&
+                gpsCourseValid &&
+                (spd_mph > GPS_SPEED_MIN_MPH) &&
+                low_lat && low_yaw_rate;
+
+  if (useGPS) {
+    float diff = wrapAngle180(yaw_gps - yaw_gyro);
+    yaw_fused = wrapAngle360(yaw_gyro + GPS_CORR_GAIN * diff);
+    yaw_mode  = 1;
+  }
+
+  // --- Raw Throttle % (no smoothing) ---
+  int adc_raw_throttle = analogRead(PIN_THROTTLE);
+
+  // Clamp into calibrated range
+  int adc_clamped = constrain(adc_raw_throttle,
+                              THROTTLE_ADC_MIN,
+                              THROTTLE_ADC_MAX);
+
+  throttle_pct = (float)(adc_clamped - THROTTLE_ADC_MIN) * 100.0f /
+                 (float)(THROTTLE_ADC_MAX - THROTTLE_ADC_MIN);
+
+  // --- Debug print & logging @ 25 Hz ---
   unsigned long nowMs = millis();
   if (nowMs - lastPrint >= PRINT_INTERVAL_MS) {
+    float dt_s = (nowMs - lastPrint) / 1000.0f;
     lastPrint = nowMs;
 
-    // Serial debug
-    Serial.print("aLPF: ax="); Serial.print(ax_lpf, 3);
-    Serial.print(" ay=");      Serial.print(ay_lpf, 3);
-    Serial.print(" az=");      Serial.print(az_lpf, 3);
+    // Snapshot tach state atomically
+    uint32_t pulses;
+    uint32_t minDtUs;
+    noInterrupts();
+    pulses  = tach_pulseCount;
+    minDtUs = tach_minDtUs;
+    tach_pulseCount = 0;
+    tach_minDtUs = 0xFFFFFFFF;
+    interrupts();
 
-    Serial.print(" | roll_f=");  Serial.print(roll_f, 1);
-    Serial.print(" pitch_f=");   Serial.print(pitch_f, 1);
-    Serial.print(" yaw_f=");     Serial.print(yaw_f, 1);
+    // --- Serial debug ---
+    Serial.print("aLPF: ax="); Serial.print(ax_lpf,3);
+    Serial.print(" ay=");      Serial.print(ay_lpf,3);
+    Serial.print(" az=");      Serial.print(az_lpf,3);
+    Serial.print(" | |a|=");   Serial.print(acc_norm,3);
 
-    Serial.print(" | lat=");     Serial.print(lat, 6);
-    Serial.print(" lon=");       Serial.print(lon, 6);
-    Serial.print(" spd_mph=");   Serial.print(spd_mph, 1);
+    Serial.print(" | roll=");      Serial.print(roll_f,1);
+    Serial.print(" pitch=");       Serial.print(pitch_f,1);
+    Serial.print(" yaw_gyro=");    Serial.print(yaw_gyro,1);
+    Serial.print(" yaw_fused=");   Serial.print(yaw_fused,1);
+    Serial.print(" yaw_mag=");     Serial.print(yaw_mag,1);
+    Serial.print(" yaw_gps=");     Serial.print(yaw_gps,1);
+    Serial.print(" mode=");        Serial.print(yaw_mode);
+
+    Serial.print(" | lat=");       Serial.print(lat,6);
+    Serial.print(" lon=");         Serial.print(lon,6);
+    Serial.print(" spd=");         Serial.print(spd_mph,1);
+
+    Serial.print(" | tach_pulses=");   Serial.print(pulses);
+    Serial.print(" min_dt_us=");
+    if (minDtUs == 0xFFFFFFFF) Serial.print("NA");
+    else                       Serial.print(minDtUs);
+
+    Serial.print(" | throttle_pct=");
+    Serial.print(throttle_pct, 1);
+
+    Serial.print(" dt_s="); Serial.print(dt_s,3);
     Serial.println();
 
-    // SD CSV: time_ms,ax,ay,az,roll,pitch,yaw,lat,lon,spd_mph
+    // --- Logging to SD (17 columns) ---
     if (logFile) {
-      logFile.print(nowMs);          logFile.print(',');
-      logFile.print(ax_lpf, 3);      logFile.print(',');
-      logFile.print(ay_lpf, 3);      logFile.print(',');
-      logFile.print(az_lpf, 3);      logFile.print(',');
-      logFile.print(roll_f, 1);      logFile.print(',');
-      logFile.print(pitch_f, 1);     logFile.print(',');
-      logFile.print(yaw_f, 1);       logFile.print(',');
-      logFile.print(lat, 6);         logFile.print(',');
-      logFile.print(lon, 6);         logFile.print(',');
-      logFile.println(spd_mph, 1);
+      logFile.print(nowMs);        logFile.print(',');
+      logFile.print(ax_lpf,3);     logFile.print(',');
+      logFile.print(ay_lpf,3);     logFile.print(',');
+      logFile.print(az_lpf,3);     logFile.print(',');
+      logFile.print(roll_f,1);     logFile.print(',');
+      logFile.print(pitch_f,1);    logFile.print(',');
+      logFile.print(yaw_fused,1);  logFile.print(',');
+      logFile.print(yaw_gyro,1);   logFile.print(',');
+      logFile.print(yaw_mag,1);    logFile.print(',');
+      logFile.print(yaw_gps,1);    logFile.print(',');
+      logFile.print(lat,6);        logFile.print(',');
+      logFile.print(lon,6);        logFile.print(',');
+      logFile.print(spd_mph,1);    logFile.print(',');
+      logFile.print((int)yaw_mode);logFile.print(',');
 
-      logFile.flush();  // simple but safe; 10 Hz is fine
+      // tach pulses & smallest dt
+      logFile.print(pulses);       logFile.print(',');
+      if (minDtUs == 0xFFFFFFFF) {
+        logFile.print(0);          // 0 = "no pulses" sentinel
+      } else {
+        logFile.print(minDtUs);
+      }
+      logFile.print(',');
+
+      // Raw throttle %
+      logFile.println(throttle_pct, 1);
+
+      logFile.flush();
     }
   }
 }
